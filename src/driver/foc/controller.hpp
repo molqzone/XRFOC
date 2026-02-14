@@ -1,12 +1,13 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <type_traits>
 
-#include "foc_types.hpp"
 #include "../../utils/clarke.hpp"
 #include "../../utils/park.hpp"
 #include "../../utils/svpwm.hpp"
+#include "foc_types.hpp"
 
 namespace LibXR::FOC
 {
@@ -52,9 +53,7 @@ class Controller
   };
 
   Controller(PositionType& position, CurrentType& current, InverterType& inverter)
-      : position_(position),
-        current_(current),
-        inverter_(inverter)
+      : position_(position), current_(current), inverter_(inverter)
   {
     static_assert(std::is_convertible<PositionSampleType, float>::value,
                   "Position::SampleType must be convertible to float angle.");
@@ -83,26 +82,18 @@ class Controller
     q_integral_ = 0.0f;
   }
 
-  decltype(auto) EnablePowerStage(bool in_isr)
-  {
-    return inverter_.Enable(in_isr);
-  }
+  decltype(auto) EnablePowerStage(bool in_isr) { return inverter_.Enable(in_isr); }
 
-  decltype(auto) DisablePowerStage(bool in_isr)
-  {
-    return inverter_.Disable(in_isr);
-  }
+  decltype(auto) DisablePowerStage(bool in_isr) { return inverter_.Disable(in_isr); }
 
   decltype(auto) Step(float dt, bool in_isr)
   {
-    DutyUVW duty = CoreStep(dt, nullptr);
-    return inverter_.SetDuty(duty, in_isr);
+    return inverter_.SetDuty(CoreStepImpl<false>(dt, nullptr), in_isr);
   }
 
   decltype(auto) StepInto(float dt, bool in_isr, StepResult& out)
   {
-    DutyUVW duty = CoreStep(dt, &out);
-    return inverter_.SetDuty(duty, in_isr);
+    return inverter_.SetDuty(CoreStepImpl<true>(dt, &out), in_isr);
   }
 
  private:
@@ -112,25 +103,30 @@ class Controller
     {
       limit = 0.0f;
     }
-    return std::fmax(-limit, std::fmin(limit, value));
+    if (value > limit)
+    {
+      return limit;
+    }
+    if (value < -limit)
+    {
+      return -limit;
+    }
+    return value;
   }
 
   static float NormalizeAngle(float angle)
   {
-    constexpr float TWO_PI = 6.28318530717958647692f;
-    if (angle >= TWO_PI)
+    constexpr float two_pi = 6.28318530717958647692f;
+    constexpr float inv_two_pi = 0.15915494309189533577f;  // 1 / (2*pi)
+    const int32_t rev = static_cast<int32_t>(angle * inv_two_pi);
+    angle -= static_cast<float>(rev) * two_pi;
+    if (angle < 0.0f)
     {
-      do
-      {
-        angle -= TWO_PI;
-      } while (angle >= TWO_PI);
+      angle += two_pi;
     }
-    else if (angle < 0.0f)
+    else if (angle >= two_pi)
     {
-      do
-      {
-        angle += TWO_PI;
-      } while (angle < 0.0f);
+      angle -= two_pi;
     }
     return angle;
   }
@@ -138,22 +134,19 @@ class Controller
   static float RunCurrentPI(float target, float measured, float dt, float& integral,
                             const PIConfig& cfg)
   {
-    const float ERROR = target - measured;
-    const float P_TERM = cfg.kp * ERROR;
-    const float I_CANDIDATE =
-        ClampSymmetric(integral + cfg.ki * ERROR * dt, cfg.integral_limit);
-    const float UNSAT_OUTPUT = P_TERM + I_CANDIDATE;
-    const float SAT_OUTPUT = ClampSymmetric(UNSAT_OUTPUT, cfg.output_limit);
-
-    const bool SATURATING_HIGH = UNSAT_OUTPUT > SAT_OUTPUT;
-    const bool SATURATING_LOW = UNSAT_OUTPUT < SAT_OUTPUT;
-    if ((!SATURATING_HIGH && !SATURATING_LOW) ||
-        (SATURATING_HIGH && ERROR < 0.0f) || (SATURATING_LOW && ERROR > 0.0f))
+    const float error = target - measured;
+    const float p_term = cfg.kp * error;
+    const float i_candidate =
+        ClampSymmetric(integral + cfg.ki * error * dt, cfg.integral_limit);
+    const float unsat_output = p_term + i_candidate;
+    const float sat_output = ClampSymmetric(unsat_output, cfg.output_limit);
+    const float sat_delta = sat_output - unsat_output;
+    if (sat_delta * error >= 0.0f)
     {
-      integral = I_CANDIDATE;
+      integral = i_candidate;
     }
 
-    return SAT_OUTPUT;
+    return sat_output;
   }
 
   static DQ LimitVoltageVector(DQ v_dq, float limit)
@@ -163,68 +156,66 @@ class Controller
       return v_dq;
     }
 
-    const float MAG_SQ = v_dq.d * v_dq.d + v_dq.q * v_dq.q;
-    const float LIMIT_SQ = limit * limit;
-    if (MAG_SQ <= LIMIT_SQ || MAG_SQ <= 1e-12f)
+    const float mag_sq = v_dq.d * v_dq.d + v_dq.q * v_dq.q;
+    const float limit_sq = limit * limit;
+    if (mag_sq <= limit_sq || mag_sq <= 1e-12f)
     {
       return v_dq;
     }
 
-    const float SCALE = limit / std::sqrt(MAG_SQ);
-    return {v_dq.d * SCALE, v_dq.q * SCALE};
+    const float scale = limit / std::sqrt(mag_sq);
+    return {v_dq.d * scale, v_dq.q * scale};
   }
 
-  float ResolveVoltageLimit() const
+  template <bool CaptureResult>
+  DutyUVW CoreStepImpl(float dt, StepResult* out)
   {
-    if (config_.output_voltage_limit > 0.0f)
-    {
-      return config_.output_voltage_limit;
-    }
+    const PositionSampleType position_sample = position_.Read();
+    const CurrentSampleType current_sample = current_.Read();
 
-    constexpr float INV_SQRT3 = 0.5773502691896258f;
-    const float VBUS = inverter_.BusVoltage();
-    return (VBUS > 0.0f) ? (VBUS * INV_SQRT3) : 0.0f;
-  }
+    const float position_angle = static_cast<float>(position_sample);
+    const float electrical_angle =
+        NormalizeAngle(position_angle * config_.pole_pairs + config_.electrical_offset);
+    float sin_theta = 0.0f;
+    float cos_theta = 0.0f;
+    SinCos(electrical_angle, sin_theta, cos_theta);
+    const float bus_voltage = inverter_.BusVoltage();
 
-  DutyUVW CoreStep(float dt, StepResult* out)
-  {
-    const PositionSampleType POSITION_SAMPLE = position_.Read();
-    const CurrentSampleType CURRENT_SAMPLE = current_.Read();
-
-    const float POSITION_ANGLE = static_cast<float>(POSITION_SAMPLE);
-    const float ELECTRICAL_ANGLE =
-        NormalizeAngle(POSITION_ANGLE * config_.pole_pairs + config_.electrical_offset);
-
-    const PhaseCurrentABC CURRENT_ABC = static_cast<PhaseCurrentABC>(CURRENT_SAMPLE);
-    const AlphaBeta CURRENT_AB = Clarke(CURRENT_ABC);
-    const DQ CURRENT_DQ = Park(CURRENT_AB, ELECTRICAL_ANGLE);
+    const PhaseCurrentABC current_abc = static_cast<PhaseCurrentABC>(current_sample);
+    const AlphaBeta current_ab = Clarke(current_abc);
+    const DQ current_dq = Park(current_ab, sin_theta, cos_theta);
 
     DQ voltage_dq = {};
-    voltage_dq.d = RunCurrentPI(target_current_dq_.d, CURRENT_DQ.d, dt, d_integral_,
-                                config_.d_axis);
-    voltage_dq.q = RunCurrentPI(target_current_dq_.q, CURRENT_DQ.q, dt, q_integral_,
-                                config_.q_axis);
-    voltage_dq = LimitVoltageVector(voltage_dq, ResolveVoltageLimit());
+    voltage_dq.d =
+        RunCurrentPI(target_current_dq_.d, current_dq.d, dt, d_integral_, config_.d_axis);
+    voltage_dq.q =
+        RunCurrentPI(target_current_dq_.q, current_dq.q, dt, q_integral_, config_.q_axis);
+    constexpr float inv_sqrt3 = 0.5773502691896258f;
+    const float voltage_limit =
+        (config_.output_voltage_limit > 0.0f)
+            ? config_.output_voltage_limit
+            : ((bus_voltage > 0.0f) ? (bus_voltage * inv_sqrt3) : 0.0f);
+    voltage_dq = LimitVoltageVector(voltage_dq, voltage_limit);
 
-    const AlphaBeta VOLTAGE_AB = InversePark(voltage_dq, ELECTRICAL_ANGLE);
-    const DutyUVW DUTY = SpaceVectorModulation(VOLTAGE_AB, inverter_.BusVoltage());
+    const AlphaBeta voltage_ab = InversePark(voltage_dq, sin_theta, cos_theta);
+    const DutyUVW duty = SpaceVectorModulation(voltage_ab, bus_voltage);
 
-    if (out != nullptr)
+    if constexpr (CaptureResult)
     {
       out->dt = dt;
-      out->electrical_angle = ELECTRICAL_ANGLE;
-      out->position = POSITION_SAMPLE;
-      out->current = CURRENT_SAMPLE;
+      out->electrical_angle = electrical_angle;
+      out->position = position_sample;
+      out->current = current_sample;
       out->target_current_dq = target_current_dq_;
-      out->current_abc = CURRENT_ABC;
-      out->current_ab = CURRENT_AB;
-      out->current_dq = CURRENT_DQ;
+      out->current_abc = current_abc;
+      out->current_ab = current_ab;
+      out->current_dq = current_dq;
       out->voltage_dq = voltage_dq;
-      out->voltage_ab = VOLTAGE_AB;
-      out->duty = DUTY;
+      out->voltage_ab = voltage_ab;
+      out->duty = duty;
     }
 
-    return DUTY;
+    return duty;
   }
 
   PositionType& position_;
