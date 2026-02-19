@@ -3,10 +3,11 @@
 #include <cmath>
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 #include "../../utils/clarke.hpp"
 #include "../../utils/park.hpp"
-#include "../../utils/svpwm.hpp"
+#include "utils/svpwm.hpp"
 #include "foc_types.hpp"
 
 namespace LibXR::FOC
@@ -88,12 +89,52 @@ class Controller
 
   decltype(auto) Step(float dt, bool in_isr)
   {
-    return inverter_.SetDuty(CoreStepImpl<false>(dt, nullptr), in_isr);
+    return inverter_.SetDuty(
+        CoreStepImpl<false>(
+            dt, nullptr,
+            [](float electrical_angle, float& sin_theta, float& cos_theta)
+            { sin_cos(electrical_angle, sin_theta, cos_theta); }),
+        in_isr);
   }
 
   decltype(auto) StepInto(float dt, bool in_isr, StepResult& out)
   {
-    return inverter_.SetDuty(CoreStepImpl<true>(dt, &out), in_isr);
+    return inverter_.SetDuty(
+        CoreStepImpl<true>(
+            dt, &out,
+            [](float electrical_angle, float& sin_theta, float& cos_theta)
+            { sin_cos(electrical_angle, sin_theta, cos_theta); }),
+        in_isr);
+  }
+
+  template <typename TrigProvider>
+  decltype(auto) StepWithTrig(float dt, bool in_isr, const TrigProvider& trig)
+  {
+    return inverter_.SetDuty(
+        CoreStepImpl<false>(
+            dt, nullptr,
+            [&trig](float electrical_angle, float& sin_theta, float& cos_theta)
+            {
+              const auto TRIG_PAIR = trig.SinCos(electrical_angle);
+              sin_theta = TRIG_PAIR.sin;
+              cos_theta = TRIG_PAIR.cos;
+            }),
+        in_isr);
+  }
+
+  template <typename TrigProvider>
+  decltype(auto) StepWithTrigInto(float dt, bool in_isr, const TrigProvider& trig, StepResult& out)
+  {
+    return inverter_.SetDuty(
+        CoreStepImpl<true>(
+            dt, &out,
+            [&trig](float electrical_angle, float& sin_theta, float& cos_theta)
+            {
+              const auto TRIG_PAIR = trig.SinCos(electrical_angle);
+              sin_theta = TRIG_PAIR.sin;
+              cos_theta = TRIG_PAIR.cos;
+            }),
+        in_isr);
   }
 
  private:
@@ -116,17 +157,17 @@ class Controller
 
   static float NormalizeAngle(float angle)
   {
-    constexpr float two_pi = 6.28318530717958647692f;
-    constexpr float inv_two_pi = 0.15915494309189533577f;  // 1 / (2*pi)
-    const int32_t rev = static_cast<int32_t>(angle * inv_two_pi);
-    angle -= static_cast<float>(rev) * two_pi;
+    constexpr float TWO_PI = 6.28318530717958647692f;
+    constexpr float INV_TWO_PI = 0.15915494309189533577f;  // 1 / (2*pi)
+    const int32_t REV = static_cast<int32_t>(angle * INV_TWO_PI);
+    angle -= static_cast<float>(REV) * TWO_PI;
     if (angle < 0.0f)
     {
-      angle += two_pi;
+      angle += TWO_PI;
     }
-    else if (angle >= two_pi)
+    else if (angle >= TWO_PI)
     {
-      angle -= two_pi;
+      angle -= TWO_PI;
     }
     return angle;
   }
@@ -134,19 +175,19 @@ class Controller
   static float RunCurrentPI(float target, float measured, float dt, float& integral,
                             const PIConfig& cfg)
   {
-    const float error = target - measured;
-    const float p_term = cfg.kp * error;
-    const float i_candidate =
-        ClampSymmetric(integral + cfg.ki * error * dt, cfg.integral_limit);
-    const float unsat_output = p_term + i_candidate;
-    const float sat_output = ClampSymmetric(unsat_output, cfg.output_limit);
-    const float sat_delta = sat_output - unsat_output;
-    if (sat_delta * error >= 0.0f)
+    const float ERROR = target - measured;
+    const float P_TERM = cfg.kp * ERROR;
+    const float I_CANDIDATE =
+        ClampSymmetric(integral + cfg.ki * ERROR * dt, cfg.integral_limit);
+    const float UNSAT_OUTPUT = P_TERM + I_CANDIDATE;
+    const float SAT_OUTPUT = ClampSymmetric(UNSAT_OUTPUT, cfg.output_limit);
+    const float SAT_DELTA = SAT_OUTPUT - UNSAT_OUTPUT;
+    if (SAT_DELTA * ERROR >= 0.0f)
     {
-      integral = i_candidate;
+      integral = I_CANDIDATE;
     }
 
-    return sat_output;
+    return SAT_OUTPUT;
   }
 
   static DQ LimitVoltageVector(DQ v_dq, float limit)
@@ -156,66 +197,66 @@ class Controller
       return v_dq;
     }
 
-    const float mag_sq = v_dq.d * v_dq.d + v_dq.q * v_dq.q;
-    const float limit_sq = limit * limit;
-    if (mag_sq <= limit_sq || mag_sq <= 1e-12f)
+    const float MAG_SQ = v_dq.d * v_dq.d + v_dq.q * v_dq.q;
+    const float LIMIT_SQ = limit * limit;
+    if (MAG_SQ <= LIMIT_SQ || MAG_SQ <= 1e-12f)
     {
       return v_dq;
     }
 
-    const float scale = limit / std::sqrt(mag_sq);
-    return {v_dq.d * scale, v_dq.q * scale};
+    const float SCALE = limit / std::sqrt(MAG_SQ);
+    return {v_dq.d * SCALE, v_dq.q * SCALE};
   }
 
-  template <bool CaptureResult>
-  DutyUVW CoreStepImpl(float dt, StepResult* out)
+  template <bool CaptureResult, typename SinCosFn>
+  DutyUVW CoreStepImpl(float dt, StepResult* out, SinCosFn&& sin_cos_fn)
   {
-    const PositionSampleType position_sample = position_.Read();
-    const CurrentSampleType current_sample = current_.Read();
+    const PositionSampleType POSITION_SAMPLE = position_.Read();
+    const CurrentSampleType CURRENT_SAMPLE = current_.Read();
 
-    const float position_angle = static_cast<float>(position_sample);
-    const float electrical_angle =
-        NormalizeAngle(position_angle * config_.pole_pairs + config_.electrical_offset);
+    const float POSITION_ANGLE = static_cast<float>(POSITION_SAMPLE);
+    const float ELECTRICAL_ANGLE =
+        NormalizeAngle(POSITION_ANGLE * config_.pole_pairs + config_.electrical_offset);
     float sin_theta = 0.0f;
     float cos_theta = 0.0f;
-    SinCos(electrical_angle, sin_theta, cos_theta);
-    const float bus_voltage = inverter_.BusVoltage();
+    std::forward<SinCosFn>(sin_cos_fn)(ELECTRICAL_ANGLE, sin_theta, cos_theta);
+    const float BUS_VOLTAGE = inverter_.BusVoltage();
 
-    const PhaseCurrentABC current_abc = static_cast<PhaseCurrentABC>(current_sample);
-    const AlphaBeta current_ab = Clarke(current_abc);
-    const DQ current_dq = Park(current_ab, sin_theta, cos_theta);
+    const PhaseCurrentABC CURRENT_ABC = static_cast<PhaseCurrentABC>(CURRENT_SAMPLE);
+    const AlphaBeta CURRENT_AB = clarke(CURRENT_ABC);
+    const DQ CURRENT_DQ = park(CURRENT_AB, sin_theta, cos_theta);
 
     DQ voltage_dq = {};
     voltage_dq.d =
-        RunCurrentPI(target_current_dq_.d, current_dq.d, dt, d_integral_, config_.d_axis);
+        RunCurrentPI(target_current_dq_.d, CURRENT_DQ.d, dt, d_integral_, config_.d_axis);
     voltage_dq.q =
-        RunCurrentPI(target_current_dq_.q, current_dq.q, dt, q_integral_, config_.q_axis);
-    constexpr float inv_sqrt3 = 0.5773502691896258f;
-    const float voltage_limit =
+        RunCurrentPI(target_current_dq_.q, CURRENT_DQ.q, dt, q_integral_, config_.q_axis);
+    constexpr float INV_SQRT3 = 0.5773502691896258f;
+    const float VOLTAGE_LIMIT =
         (config_.output_voltage_limit > 0.0f)
             ? config_.output_voltage_limit
-            : ((bus_voltage > 0.0f) ? (bus_voltage * inv_sqrt3) : 0.0f);
-    voltage_dq = LimitVoltageVector(voltage_dq, voltage_limit);
+            : ((BUS_VOLTAGE > 0.0f) ? (BUS_VOLTAGE * INV_SQRT3) : 0.0f);
+    voltage_dq = LimitVoltageVector(voltage_dq, VOLTAGE_LIMIT);
 
-    const AlphaBeta voltage_ab = InversePark(voltage_dq, sin_theta, cos_theta);
-    const DutyUVW duty = SpaceVectorModulation(voltage_ab, bus_voltage);
+    const AlphaBeta VOLTAGE_AB = inverse_park(voltage_dq, sin_theta, cos_theta);
+    const DutyUVW DUTY = space_vector_modulation(VOLTAGE_AB, BUS_VOLTAGE);
 
     if constexpr (CaptureResult)
     {
       out->dt = dt;
-      out->electrical_angle = electrical_angle;
-      out->position = position_sample;
-      out->current = current_sample;
+      out->electrical_angle = ELECTRICAL_ANGLE;
+      out->position = POSITION_SAMPLE;
+      out->current = CURRENT_SAMPLE;
       out->target_current_dq = target_current_dq_;
-      out->current_abc = current_abc;
-      out->current_ab = current_ab;
-      out->current_dq = current_dq;
+      out->current_abc = CURRENT_ABC;
+      out->current_ab = CURRENT_AB;
+      out->current_dq = CURRENT_DQ;
       out->voltage_dq = voltage_dq;
-      out->voltage_ab = voltage_ab;
-      out->duty = duty;
+      out->voltage_ab = VOLTAGE_AB;
+      out->duty = DUTY;
     }
 
-    return duty;
+    return DUTY;
   }
 
   PositionType& position_;

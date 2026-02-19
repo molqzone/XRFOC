@@ -2,12 +2,12 @@
 
 #include <cmath>
 
-#include "../driver/foc/foc_types.hpp"
+#include "foc_types.hpp"
 
 namespace LibXR::FOC
 {
 
-inline DutyUVW SpaceVectorModulation(const AlphaBeta& voltage_ab, float bus_voltage)
+inline DutyUVW space_vector_modulation(const AlphaBeta& voltage_ab, float bus_voltage)
 {
   if (bus_voltage <= 1e-6f)
   {
