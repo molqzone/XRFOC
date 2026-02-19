@@ -5,10 +5,10 @@
 #include <type_traits>
 #include <utility>
 
-#include "../../utils/clarke.hpp"
-#include "../../utils/park.hpp"
+#include "foc_defs.hpp"
+#include "utils/clarke.hpp"
+#include "utils/park.hpp"
 #include "utils/svpwm.hpp"
-#include "foc_types.hpp"
 
 namespace LibXR::FOC
 {
@@ -62,7 +62,11 @@ class Controller
                   "Current::SampleType must be convertible to PhaseCurrentABC.");
   }
 
-  void SetConfig(const Configuration& config) { config_ = config; }
+  void SetConfig(const Configuration& config)
+  {
+    config_ = config;
+    SanitizeConfig(config_);
+  }
   [[nodiscard]] const Configuration& GetConfig() const { return config_; }
 
   void SetTargetCurrent(DQ target_current_dq) { target_current_dq_ = target_current_dq; }
@@ -90,20 +94,18 @@ class Controller
   decltype(auto) Step(float dt, bool in_isr)
   {
     return inverter_.SetDuty(
-        CoreStepImpl<false>(
-            dt, nullptr,
-            [](float electrical_angle, float& sin_theta, float& cos_theta)
-            { sin_cos(electrical_angle, sin_theta, cos_theta); }),
+        CoreStepImpl<false>(dt, nullptr,
+                            [](float electrical_angle, float& sin_theta, float& cos_theta)
+                            { sin_cos(electrical_angle, sin_theta, cos_theta); }),
         in_isr);
   }
 
   decltype(auto) StepInto(float dt, bool in_isr, StepResult& out)
   {
     return inverter_.SetDuty(
-        CoreStepImpl<true>(
-            dt, &out,
-            [](float electrical_angle, float& sin_theta, float& cos_theta)
-            { sin_cos(electrical_angle, sin_theta, cos_theta); }),
+        CoreStepImpl<true>(dt, &out,
+                           [](float electrical_angle, float& sin_theta, float& cos_theta)
+                           { sin_cos(electrical_angle, sin_theta, cos_theta); }),
         in_isr);
   }
 
@@ -123,7 +125,23 @@ class Controller
   }
 
   template <typename TrigProvider>
-  decltype(auto) StepWithTrigInto(float dt, bool in_isr, const TrigProvider& trig, StepResult& out)
+  decltype(auto) StepWithTrigNoConfig(float dt, bool in_isr, const TrigProvider& trig)
+  {
+    return inverter_.SetDuty(
+        CoreStepImpl<false>(
+            dt, nullptr,
+            [&trig](float electrical_angle, float& sin_theta, float& cos_theta)
+            {
+              const auto TRIG_PAIR = trig.SinCosNoConfig(electrical_angle);
+              sin_theta = TRIG_PAIR.sin;
+              cos_theta = TRIG_PAIR.cos;
+            }),
+        in_isr);
+  }
+
+  template <typename TrigProvider>
+  decltype(auto) StepWithTrigInto(float dt, bool in_isr, const TrigProvider& trig,
+                                  StepResult& out)
   {
     return inverter_.SetDuty(
         CoreStepImpl<true>(
@@ -137,22 +155,41 @@ class Controller
         in_isr);
   }
 
+  template <typename TrigProvider>
+  decltype(auto) StepWithTrigIntoNoConfig(float dt, bool in_isr, const TrigProvider& trig,
+                                          StepResult& out)
+  {
+    return inverter_.SetDuty(
+        CoreStepImpl<true>(
+            dt, &out,
+            [&trig](float electrical_angle, float& sin_theta, float& cos_theta)
+            {
+              const auto TRIG_PAIR = trig.SinCosNoConfig(electrical_angle);
+              sin_theta = TRIG_PAIR.sin;
+              cos_theta = TRIG_PAIR.cos;
+            }),
+        in_isr);
+  }
+
  private:
+  static float ClampNonNegative(float value) { return (value >= 0.0f) ? value : 0.0f; }
+
+  static void SanitizePIConfig(PIConfig& cfg)
+  {
+    cfg.integral_limit = ClampNonNegative(cfg.integral_limit);
+    cfg.output_limit = ClampNonNegative(cfg.output_limit);
+  }
+
+  static void SanitizeConfig(Configuration& cfg)
+  {
+    SanitizePIConfig(cfg.d_axis);
+    SanitizePIConfig(cfg.q_axis);
+  }
+
   static float ClampSymmetric(float value, float limit)
   {
-    if (limit < 0.0f)
-    {
-      limit = 0.0f;
-    }
-    if (value > limit)
-    {
-      return limit;
-    }
-    if (value < -limit)
-    {
-      return -limit;
-    }
-    return value;
+    // Hot path: limit is sanitized in SetConfig().
+    return std::fmax(-limit, std::fmin(value, limit));
   }
 
   static float NormalizeAngle(float angle)
@@ -165,20 +202,15 @@ class Controller
     {
       angle += TWO_PI;
     }
-    else if (angle >= TWO_PI)
-    {
-      angle -= TWO_PI;
-    }
     return angle;
   }
 
-  static float RunCurrentPI(float target, float measured, float dt, float& integral,
+  static float RunCurrentPI(float target, float measured, float ki_dt, float& integral,
                             const PIConfig& cfg)
   {
     const float ERROR = target - measured;
     const float P_TERM = cfg.kp * ERROR;
-    const float I_CANDIDATE =
-        ClampSymmetric(integral + cfg.ki * ERROR * dt, cfg.integral_limit);
+    const float I_CANDIDATE = ClampSymmetric(integral + ki_dt * ERROR, cfg.integral_limit);
     const float UNSAT_OUTPUT = P_TERM + I_CANDIDATE;
     const float SAT_OUTPUT = ClampSymmetric(UNSAT_OUTPUT, cfg.output_limit);
     const float SAT_DELTA = SAT_OUTPUT - UNSAT_OUTPUT;
@@ -190,6 +222,11 @@ class Controller
     return SAT_OUTPUT;
   }
 
+  static float scale_for_voltage_limit(float limit, float magnitude_sq)
+  {
+    return limit * detail::inv_sqrt_approx_unchecked(magnitude_sq);
+  }
+
   static DQ LimitVoltageVector(DQ v_dq, float limit)
   {
     if (limit <= 0.0f)
@@ -199,12 +236,12 @@ class Controller
 
     const float MAG_SQ = v_dq.d * v_dq.d + v_dq.q * v_dq.q;
     const float LIMIT_SQ = limit * limit;
-    if (MAG_SQ <= LIMIT_SQ || MAG_SQ <= 1e-12f)
+    if (MAG_SQ <= LIMIT_SQ)
     {
       return v_dq;
     }
 
-    const float SCALE = limit / std::sqrt(MAG_SQ);
+    const float SCALE = scale_for_voltage_limit(limit, MAG_SQ);
     return {v_dq.d * SCALE, v_dq.q * SCALE};
   }
 
@@ -226,11 +263,13 @@ class Controller
     const AlphaBeta CURRENT_AB = clarke(CURRENT_ABC);
     const DQ CURRENT_DQ = park(CURRENT_AB, sin_theta, cos_theta);
 
+    const float D_KI_DT = config_.d_axis.ki * dt;
+    const float Q_KI_DT = config_.q_axis.ki * dt;
     DQ voltage_dq = {};
     voltage_dq.d =
-        RunCurrentPI(target_current_dq_.d, CURRENT_DQ.d, dt, d_integral_, config_.d_axis);
+        RunCurrentPI(target_current_dq_.d, CURRENT_DQ.d, D_KI_DT, d_integral_, config_.d_axis);
     voltage_dq.q =
-        RunCurrentPI(target_current_dq_.q, CURRENT_DQ.q, dt, q_integral_, config_.q_axis);
+        RunCurrentPI(target_current_dq_.q, CURRENT_DQ.q, Q_KI_DT, q_integral_, config_.q_axis);
     constexpr float INV_SQRT3 = 0.5773502691896258f;
     const float VOLTAGE_LIMIT =
         (config_.output_voltage_limit > 0.0f)

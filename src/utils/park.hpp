@@ -2,14 +2,31 @@
 
 #include <cmath>
 
-#include "foc_types.hpp"
+#if defined(__has_include)
+#if __has_include("arm_math.h")
+#include "arm_math.h"
+#define XRFOC_HAS_CMSIS_TRIG 1
+#endif
+#endif
+
+#include "foc_defs.hpp"
 
 namespace LibXR::FOC
 {
 
 inline void sin_cos(float electrical_angle, float& sin_theta, float& cos_theta)
 {
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(XRFOC_HAS_CMSIS_TRIG)
+  sin_theta = arm_sin_f32(electrical_angle);
+  cos_theta = arm_cos_f32(electrical_angle);
+#elif defined(__has_builtin)
+#if __has_builtin(__builtin_sincosf)
+  __builtin_sincosf(electrical_angle, &sin_theta, &cos_theta);
+#else
+  sin_theta = std::sinf(electrical_angle);
+  cos_theta = std::cosf(electrical_angle);
+#endif
+#elif defined(__GNUC__)
   __builtin_sincosf(electrical_angle, &sin_theta, &cos_theta);
 #else
   sin_theta = std::sinf(electrical_angle);

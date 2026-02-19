@@ -2,10 +2,15 @@
 
 #include <cmath>
 
-#include "foc_types.hpp"
+#include "foc_defs.hpp"
 
 namespace LibXR::FOC
 {
+
+inline float inv_bus_for_svpwm(float bus_voltage)
+{
+  return detail::reciprocal_approx_unchecked(bus_voltage);
+}
 
 inline DutyUVW space_vector_modulation(const AlphaBeta& voltage_ab, float bus_voltage)
 {
@@ -21,11 +26,11 @@ inline DutyUVW space_vector_modulation(const AlphaBeta& voltage_ab, float bus_vo
   const float VB = -HALF * voltage_ab.alpha + SQRT3_OVER_2 * voltage_ab.beta;
   const float VC = -HALF * voltage_ab.alpha - SQRT3_OVER_2 * voltage_ab.beta;
 
-  const float VMAX = (VA > VB) ? ((VA > VC) ? VA : VC) : ((VB > VC) ? VB : VC);
-  const float VMIN = (VA < VB) ? ((VA < VC) ? VA : VC) : ((VB < VC) ? VB : VC);
+  const float VMAX = std::fmax(VA, std::fmax(VB, VC));
+  const float VMIN = std::fmin(VA, std::fmin(VB, VC));
   const float VOFFSET = HALF * (VMAX + VMIN);
 
-  const float INV_BUS = 1.0f / bus_voltage;
+  const float INV_BUS = inv_bus_for_svpwm(bus_voltage);
   const float DU = HALF + (VA - VOFFSET) * INV_BUS;
   const float DV = HALF + (VB - VOFFSET) * INV_BUS;
   const float DW = HALF + (VC - VOFFSET) * INV_BUS;

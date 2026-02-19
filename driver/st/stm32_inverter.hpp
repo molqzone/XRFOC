@@ -2,13 +2,12 @@
 
 #include <cstdint>
 
-#include "stm32g4xx_hal.h"
+#include "main.h"
 
 #ifdef HAL_TIM_MODULE_ENABLED
 
-#include "foc_types.hpp"
+#include "foc_defs.hpp"
 #include "libxr_def.hpp"
-#include "stm32g4xx_ll_tim.h"
 
 namespace LibXR::FOC
 {
@@ -126,9 +125,9 @@ class STM32Inverter
       return LibXR::ErrorCode::INIT_ERR;
     }
 
-    LL_TIM_OC_EnablePreload(htim_->Instance, HalChannelToLLChannel(channel_u_));
-    LL_TIM_OC_EnablePreload(htim_->Instance, HalChannelToLLChannel(channel_v_));
-    LL_TIM_OC_EnablePreload(htim_->Instance, HalChannelToLLChannel(channel_w_));
+    __HAL_TIM_ENABLE_OCxPRELOAD(htim_, channel_u_);
+    __HAL_TIM_ENABLE_OCxPRELOAD(htim_, channel_v_);
+    __HAL_TIM_ENABLE_OCxPRELOAD(htim_, channel_w_);
 
 #if defined(TIM_BDTR_MOE)
     if (config.complementary_output)
@@ -160,7 +159,10 @@ class STM32Inverter
     }
 #endif
 
-    LL_TIM_GenerateEvent_UPDATE(htim_->Instance);
+    if (HAL_TIM_GenerateEvent(htim_, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
+    {
+      return LibXR::ErrorCode::INIT_ERR;
+    }
     max_pulse_ = period;
     duty_to_pulse_scale_ = static_cast<float>(period + 1U);
     initialized_ = true;
@@ -195,7 +197,7 @@ class STM32Inverter
     }
 
 #if defined(TIM_BDTR_MOE)
-    LL_TIM_EnableAllOutputs(htim_->Instance);
+    __HAL_TIM_MOE_ENABLE(htim_);
 #endif
 
     enabled_ = true;
@@ -226,7 +228,7 @@ class STM32Inverter
     }
 
 #if defined(TIM_BDTR_MOE)
-    LL_TIM_DisableAllOutputs(htim_->Instance);
+    __HAL_TIM_MOE_DISABLE(htim_);
 #endif
 
     enabled_ = false;
@@ -260,23 +262,6 @@ class STM32Inverter
   [[nodiscard]] TIM_HandleTypeDef* TimerHandle() { return htim_; }
 
  private:
-  static uint32_t HalChannelToLLChannel(uint32_t channel)
-  {
-    switch (channel)
-    {
-      case TIM_CHANNEL_1:
-        return LL_TIM_CHANNEL_CH1;
-      case TIM_CHANNEL_2:
-        return LL_TIM_CHANNEL_CH2;
-      case TIM_CHANNEL_3:
-        return LL_TIM_CHANNEL_CH3;
-      case TIM_CHANNEL_4:
-        return LL_TIM_CHANNEL_CH4;
-      default:
-        return 0U;
-    }
-  }
-
   static bool IsValidChannel(uint32_t channel)
   {
     return channel == TIM_CHANNEL_1 || channel == TIM_CHANNEL_2 ||
@@ -337,8 +322,11 @@ class STM32Inverter
     return HAL_RCC_GetHCLKFreq();
 #else
     uint32_t clock_hz = HAL_RCC_GetPCLK2Freq();
-#ifdef RCC_CFGR_PPRE2
-    if ((RCC->CFGR & RCC_CFGR_PPRE2) != RCC_CFGR_PPRE2_DIV1)
+#if defined(RCC_HCLK_DIV1)
+    RCC_ClkInitTypeDef clk_cfg = {};
+    uint32_t flash_latency = 0U;
+    HAL_RCC_GetClockConfig(&clk_cfg, &flash_latency);
+    if (clk_cfg.APB2CLKDivider != RCC_HCLK_DIV1)
     {
       clock_hz *= 2U;
     }
@@ -392,19 +380,14 @@ class STM32Inverter
   volatile uint32_t* ResolveCompareRegister(uint32_t channel) const
   {
     TIM_TypeDef* tim = htim_->Instance;
-    switch (channel)
+    if (!IsValidChannel(channel))
     {
-      case TIM_CHANNEL_1:
-        return &tim->CCR1;
-      case TIM_CHANNEL_2:
-        return &tim->CCR2;
-      case TIM_CHANNEL_3:
-        return &tim->CCR3;
-      case TIM_CHANNEL_4:
-        return &tim->CCR4;
-      default:
-        return nullptr;
+      return nullptr;
     }
+
+    volatile uint32_t* ccr_regs[4] = {&tim->CCR1, &tim->CCR2, &tim->CCR3, &tim->CCR4};
+    const uint32_t REG_INDEX = channel / 4U;
+    return ccr_regs[REG_INDEX];
   }
 
   [[nodiscard]] uint32_t DutyToPulse(float duty) const
