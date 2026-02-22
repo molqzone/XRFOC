@@ -94,7 +94,7 @@ class Controller
   decltype(auto) Step(float dt, bool in_isr)
   {
     return inverter_.SetDuty(
-        CoreStepImpl<false, false>(
+        CoreStepImpl<false, true>(
             dt, nullptr,
             [](float electrical_angle, float& sin_theta, float& cos_theta)
             { sin_cos(electrical_angle, sin_theta, cos_theta); }),
@@ -104,7 +104,7 @@ class Controller
   decltype(auto) StepInto(float dt, bool in_isr, StepResult& out)
   {
     return inverter_.SetDuty(
-        CoreStepImpl<true, false>(
+        CoreStepImpl<true, true>(
             dt, &out,
             [](float electrical_angle, float& sin_theta, float& cos_theta)
             { sin_cos(electrical_angle, sin_theta, cos_theta); }),
@@ -193,6 +193,10 @@ class Controller
   static float NormalizeAngle(float angle)
   {
     constexpr float TWO_PI = 6.28318530717958647692f;
+    if (angle >= 0.0f && angle < TWO_PI)
+    {
+      return angle;
+    }
     constexpr float INV_TWO_PI = 0.15915494309189533577f;  // 1 / (2*pi)
     const int32_t REV = static_cast<int32_t>(angle * INV_TWO_PI);
     angle -= static_cast<float>(REV) * TWO_PI;
@@ -243,7 +247,20 @@ class Controller
   static float RunCurrentPI(float target, float measured, float ki_dt, float& integral,
                             const PIConfig& cfg)
   {
+    if (cfg.kp == 0.0f && cfg.ki == 0.0f)
+    {
+      integral = 0.0f;
+      return 0.0f;
+    }
+
     const float ERROR = target - measured;
+    if (cfg.integral_limit == 0.0f || ki_dt == 0.0f)
+    {
+      integral = 0.0f;
+      const float P_ONLY_OUTPUT = cfg.kp * ERROR;
+      return ClampSymmetric(P_ONLY_OUTPUT, cfg.output_limit);
+    }
+
     const float P_TERM = cfg.kp * ERROR;
     const float I_CANDIDATE =
         ClampSymmetric(integral + ki_dt * ERROR, cfg.integral_limit);
