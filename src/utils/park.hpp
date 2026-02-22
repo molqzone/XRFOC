@@ -17,8 +17,7 @@ namespace LibXR::FOC
 inline void sin_cos(float electrical_angle, float& sin_theta, float& cos_theta)
 {
 #if defined(XRFOC_HAS_CMSIS_TRIG)
-  sin_theta = arm_sin_f32(electrical_angle);
-  cos_theta = arm_cos_f32(electrical_angle);
+  arm_sin_cos_f32(electrical_angle, &sin_theta, &cos_theta);
 #elif defined(__has_builtin)
 #if __has_builtin(__builtin_sincosf)
   __builtin_sincosf(electrical_angle, &sin_theta, &cos_theta);

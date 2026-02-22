@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cmath>
-
 #include "foc_defs.hpp"
 
 namespace LibXR::FOC
@@ -10,6 +8,16 @@ namespace LibXR::FOC
 inline float inv_bus_for_svpwm(float bus_voltage)
 {
   return detail::reciprocal_approx_unchecked(bus_voltage);
+}
+
+inline float max3_unchecked(float a, float b, float c)
+{
+  return __builtin_fmaxf(__builtin_fmaxf(a, b), c);
+}
+
+inline float min3_unchecked(float a, float b, float c)
+{
+  return __builtin_fminf(__builtin_fminf(a, b), c);
 }
 
 inline DutyUVW space_vector_modulation(const AlphaBeta& voltage_ab, float bus_voltage)
@@ -26,8 +34,8 @@ inline DutyUVW space_vector_modulation(const AlphaBeta& voltage_ab, float bus_vo
   const float VB = -HALF * voltage_ab.alpha + SQRT3_OVER_2 * voltage_ab.beta;
   const float VC = -HALF * voltage_ab.alpha - SQRT3_OVER_2 * voltage_ab.beta;
 
-  const float VMAX = std::fmax(VA, std::fmax(VB, VC));
-  const float VMIN = std::fmin(VA, std::fmin(VB, VC));
+  const float VMAX = max3_unchecked(VA, VB, VC);
+  const float VMIN = min3_unchecked(VA, VB, VC);
   const float VOFFSET = HALF * (VMAX + VMIN);
 
   const float INV_BUS = inv_bus_for_svpwm(bus_voltage);
